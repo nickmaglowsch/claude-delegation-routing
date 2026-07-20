@@ -6,7 +6,7 @@ argument-hint: "[--days N] [--max-events N]"
 
 # Delegation Audit
 
-Refinement loop for the model-routing policy in `~/.claude/DELEGATION.md` and `~/.paseo/orchestration-preferences.json`. Follow the steps strictly in order. Read-only until the user approves each edit.
+Refinement loop for the model-routing policy in `~/.claude/DELEGATION.md` and `~/.paseo/orchestration-preferences.json` (installed by `/delegation-setup`). Follow the steps strictly in order. Read-only until the user approves each edit.
 
 ## Input
 
@@ -15,10 +15,10 @@ Refinement loop for the model-routing policy in `~/.claude/DELEGATION.md` and `~
 ## Step 1: Run the scanner
 
 ```bash
-python3 ~/.claude/skills/delegation-audit/scripts/scan.py $ARGUMENTS
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/delegation-audit/scripts/scan.py" $ARGUMENTS
 ```
 
-The scanner is offline and stateless (zero LLM tokens). It walks `~/.claude/projects/**/*.jsonl` (skipping `subagents/` and `tool-results/`), extracts agent-creation tool calls (`mcp__paseo__create_agent` provider, native `Agent`/`Task` model), and reports: a routing histogram, inherited-default creations, escalations (similar task re-launched on a bigger tier or the other family), frontier models on mechanical-looking work, and user-pushback friction near handoffs. It deliberately ignores raw retry counts, runtimes, test failures, and permission errors — those signal bad task packaging, not wrong model choice.
+The scanner is offline and stateless (zero LLM tokens). It walks `~/.claude/projects/**/*.jsonl` (skipping `subagents/` and `tool-results/`), extracts agent-creation tool calls (`mcp__paseo__create_agent` provider, native `Agent`/`Task` model), and reports: a routing histogram, inherited-default creations, escalations (similar task re-launched on a bigger tier or the other family), frontier models on mechanical-looking work, and user-pushback friction near handoffs. Machine text (paseo notifications, hook output, system wrappers) is filtered out. It deliberately ignores raw retry counts, runtimes, test failures, and permission errors — those signal bad task packaging, not wrong model choice.
 
 ## Step 2: Read the report
 
@@ -30,7 +30,7 @@ Prioritize: `strong` friction events > escalations > inherited defaults > fronti
 
 **3a — transcripts.** For each selected event, open the named session file, `grep -n` for the agent title to find the line, and Read ~50 lines around it. Diagnose: was the model actually wrong for the task (misroute), or was the prompt/task packaging the problem (not a routing issue — skip it)?
 
-**3b — drift check.** Call `mcp__paseo__list_models` for providers `claude` and `codex`. Compare against the bindings in `~/.paseo/orchestration-preferences.json` and the tier assumptions in `~/.claude/DELEGATION.md`:
+**3b — drift check.** If the Paseo MCP server is available, call `mcp__paseo__list_models` for each enabled provider. Compare against the bindings in `~/.paseo/orchestration-preferences.json` and the tier assumptions in `~/.claude/DELEGATION.md`:
 - A bound model ID no longer listed → stale binding, propose the replacement.
 - A new top-tier model appeared (e.g. a new GPT frontier, a new Opus) → propose rebinding that tier.
 
