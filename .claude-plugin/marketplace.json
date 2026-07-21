@@ -6,14 +6,14 @@
   },
   "metadata": {
     "description": "Marketplace hosting the delegation-routing plugin for Claude Code.",
-    "version": "1.0.0"
+    "version": "1.1.0"
   },
   "plugins": [
     {
       "name": "delegation-routing",
       "source": "./plugins/delegation-routing",
       "description": "Deliberate model routing for agent fan-out: /delegation-setup templates a think-before-handoff policy (DELEGATION.md + optional Paseo bindings) from your live model list, and /delegation-audit refines it over time from real transcript misroutes.",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "category": "Productivity",
       "author": {
         "name": "Nicholas Salgueiro",
