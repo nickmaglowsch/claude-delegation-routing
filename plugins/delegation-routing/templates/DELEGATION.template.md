@@ -24,6 +24,18 @@ Classify on two axes:
 
 Native Agent/Workflow `model` values are the stable aliases: `haiku` / `sonnet` / `opus` / `fable`.
 
+## Fan-out budget — how many, how deep
+
+Picking the right *model* bounds the price per agent, not the total. Volume does that, and a quota blowup is almost always volume, not tier. Before fanning out, budget it:
+
+- **Default caps:** ≤ 4 agents per wave, ≤ 8 per task total. Going wider needs an explicit "yes, go wide" from the user.
+- **One level of fan-out.** A spawned agent does its own work — it does not spawn its own sub-agents unless you were told to go that deep. Recursive fan-out is how 4 agents silently become 40.
+- **Fan out only if inline won't do.** A handful of web lookups or file reads is cheaper done inline than as a delegated fleet. First question: does this need sub-agents at all?
+- **Scope to the deliverable, not the topic.** "One email with a pick and a price" is a couple of lookups, not a market study. Match width to what actually ships.
+- **High stakes ≠ upgrade the whole fleet.** "This has to be accurate" justifies *one* workhorse/frontier verifier over cheap-tier gathered data — not the entire fleet on the frontier tier. Gather cheap, verify once.
+- **Circuit-breaker.** If agents die on quota / rate-limit / API errors, STOP. Do not re-spawn into the same wall — surface the failure and wait for it to clear.
+- **Watch context size too.** A fleet of large-context (e.g. 1M) agents multiplies token cost independently of tier. Use the smallest window that fits the task.
+
 ## Contrarian pairing
 
 Substantive work authored by a Claude agent gets its review from a Codex agent, and vice versa — cross-family review catches blind spots same-family review misses. Frontier-vs-frontier (Fable vs top Codex tier) only to settle hard disagreements.

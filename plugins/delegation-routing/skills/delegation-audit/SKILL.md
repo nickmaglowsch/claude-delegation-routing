@@ -18,13 +18,18 @@ Refinement loop for the model-routing policy in `~/.claude/DELEGATION.md` and `~
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/delegation-audit/scripts/scan.py" $ARGUMENTS
 ```
 
-The scanner is offline and stateless (zero LLM tokens). It walks `~/.claude/projects/**/*.jsonl` (skipping `subagents/` and `tool-results/`), extracts agent-creation tool calls (`mcp__paseo__create_agent` provider, native `Agent`/`Task` model), and reports: a routing histogram, inherited-default creations, escalations (similar task re-launched on a bigger tier or the other family), frontier models on mechanical-looking work, and user-pushback friction near handoffs. Machine text (paseo notifications, hook output, system wrappers) is filtered out. It deliberately ignores raw retry counts, runtimes, test failures, and permission errors — those signal bad task packaging, not wrong model choice.
+The scanner is offline and stateless (zero LLM tokens). It walks both `~/.claude/projects/**/*.jsonl` and the Paseo/ccs transcript root `~/.ccs/shared/context-groups/**/*.jsonl` (skipping `subagents/` and `tool-results/`) — Paseo agents live outside `~/.claude/projects`, so scanning only the latter would miss exactly the agents that fan out. Override with `--projects-dir` (repeatable). It extracts agent-creation tool calls (`mcp__paseo__create_agent` provider, native `Agent`/`Task` model), and reports two things:
+
+- **Wrong model** — a routing histogram, inherited-default creations, escalations (similar task re-launched on a bigger tier or the other family), frontier models on mechanical-looking work, and user-pushback friction near handoffs.
+- **Too many agents** — fan-out volume (sessions creating more than the per-task cap) and quota/rate-limit deaths, including re-spawns that fired *after* a death (circuit-breaker violations). A quota blowup is almost always volume, not tier.
+
+Machine text (paseo notifications, hook output, system wrappers) is filtered out of the friction pass. It still ignores raw retry counts, runtimes, and test failures — those signal bad task packaging, not a routing or volume problem.
 
 ## Step 2: Read the report
 
 If it prints `ALL CLEAN` and the drift check (Step 3b) finds nothing, stop here and tell the user everything is clean.
 
-Prioritize: `strong` friction events > escalations > inherited defaults > frontier-on-mechanical. Take at most the top 3–5.
+Prioritize: quota-death re-spawns > `strong` friction events > wide fan-out sessions > escalations > inherited defaults > frontier-on-mechanical. Take at most the top 3–5.
 
 ## Step 3: Investigate
 
