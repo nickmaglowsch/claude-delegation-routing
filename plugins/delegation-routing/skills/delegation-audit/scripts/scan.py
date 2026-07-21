@@ -6,8 +6,13 @@ tool calls (paseo create_agent + native Agent/Task tool) and downstream
 friction signals that suggest the WRONG MODEL was chosen. Emits a plain-text
 report; an LLM triages it afterwards. Zero LLM tokens spent here.
 
-Deliberately NOT counted (noisy — usually bad task packaging, not wrong
-model): raw retry counts, long runtimes, test failures, permission errors.
+Also flags fan-out VOLUME, not just per-agent model choice: a quota blowup is
+almost always too many agents (often recursive), not the wrong tier. So it
+counts agent creations per session and quota/rate-limit deaths, including
+re-spawns that fired after a death (circuit-breaker violations).
+
+Still NOT counted (noisy — usually bad task packaging): raw retry counts, long
+runtimes, test failures, generic permission errors.
 """
 
 import argparse
@@ -21,6 +26,35 @@ from collections import Counter
 CREATE_TOOLS = {"mcp__paseo__create_agent"}
 NATIVE_AGENT_TOOLS = {"Agent", "Task"}
 SKIP_DIRS = {"subagents", "tool-results", "memory"}
+
+# Default transcript roots: native Claude sessions AND Paseo/ccs agent sessions.
+# Paseo agents live outside ~/.claude/projects, so scanning only the latter is
+# blind to exactly the agents that fan out. A missing root yields nothing, so
+# listing both is safe everywhere.
+DEFAULT_ROOTS = [
+    os.path.expanduser("~/.claude/projects"),
+    os.path.expanduser("~/.ccs/shared/context-groups"),
+]
+
+# More than this many agent creations in one session is worth a look
+# (DELEGATION.md caps a task at 8 agents total).
+FANOUT_WARN = 8
+
+# A session is worth flagging for deaths only if it re-spawned after one
+# (circuit-breaker violation) or hit a real cluster. A single lone death with
+# no re-spawn is correct behaviour — the agent stopped — so it's not reported.
+DEATH_CLUSTER = 3
+
+# Quota / rate-limit / API deaths — the actual symptom of a fan-out blowup.
+# Matched against the raw line, so it catches task-notification text too.
+# Kept deliberately specific to agent-death phrasing: bare "429"/"rate limit"/
+# "overloaded" appear all over ordinary transcripts (code, logs, discussion)
+# and would flag nearly every session.
+QUOTA_DEATH_RE = re.compile(
+    r"(hit your (session|usage|weekly) limit|terminated early due to an API error|"
+    r"overloaded_error|Claude AI usage limit reached)",
+    re.IGNORECASE,
+)
 
 # Heuristic tier rank — version-tolerant substrings, checked in order.
 TIER_RULES = [
@@ -131,14 +165,19 @@ def creations_in(entry):
 
 
 def scan_file(path):
-    """Return (creations, user_turns); creations get friction attached in-place."""
-    creations, user_turns = [], []
+    """Return (creations, user_turns, deaths); creations get friction attached in-place.
+
+    deaths = line indices where a quota/rate-limit/API death appears (any role).
+    """
+    creations, user_turns, deaths = [], [], []
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             for idx, line in enumerate(fh):
                 line = line.strip()
                 if not line:
                     continue
+                if QUOTA_DEATH_RE.search(line):
+                    deaths.append(idx)
                 try:
                     entry = json.loads(line)
                 except ValueError:
@@ -155,7 +194,7 @@ def scan_file(path):
                     user_turns.append((idx, text))
     except OSError:
         pass
-    return creations, user_turns
+    return creations, user_turns, deaths
 
 
 def attach_friction(creations, user_turns):
@@ -193,28 +232,33 @@ def find_escalations(creations):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=30)
-    ap.add_argument("--projects-dir", default=os.path.expanduser("~/.claude/projects"))
+    ap.add_argument("--projects-dir", action="append", default=None,
+                    help="Transcript root(s); repeatable. Defaults to Claude + Paseo/ccs roots.")
     ap.add_argument("--max-events", type=int, default=15)
     args = ap.parse_args()
 
+    roots = args.projects_dir or DEFAULT_ROOTS
     cutoff = time.time() - args.days * 86400
-    all_creations, files_scanned = [], 0
+    all_creations, files_scanned, file_deaths = [], 0, {}
 
-    for root, dirs, files in os.walk(args.projects_dir):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-        for fn in files:
-            if not fn.endswith(".jsonl"):
-                continue
-            path = os.path.join(root, fn)
-            try:
-                if os.path.getmtime(path) < cutoff:
+    for base in roots:
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for fn in files:
+                if not fn.endswith(".jsonl"):
                     continue
-            except OSError:
-                continue
-            files_scanned += 1
-            creations, user_turns = scan_file(path)
-            attach_friction(creations, user_turns)
-            all_creations.extend(creations)
+                path = os.path.join(root, fn)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        continue
+                except OSError:
+                    continue
+                files_scanned += 1
+                creations, user_turns, deaths = scan_file(path)
+                attach_friction(creations, user_turns)
+                all_creations.extend(creations)
+                if deaths:
+                    file_deaths[path] = deaths
 
     all_creations.sort(key=lambda c: c["ts"])
     escalations = find_escalations(all_creations)
@@ -224,6 +268,17 @@ def main():
         if tier_of(c["model"]) == 3 and MECHANICAL_RE.search(c["title"] + " " + c["prompt"])
     ]
     frictioned = [c for c in all_creations if c["friction"]]
+
+    # Fan-out volume per session, and quota-death / re-spawn-after-death.
+    per_file = Counter(c["file"] for c in all_creations)
+    wide_sessions = [(p, n) for p, n in per_file.most_common() if n > FANOUT_WARN]
+    respawns = []
+    for path, deaths in file_deaths.items():
+        first = min(deaths)
+        after = sum(1 for c in all_creations if c["file"] == path and c["idx"] > first)
+        if after > 0 or len(deaths) >= DEATH_CLUSTER:
+            respawns.append((path, len(deaths), after))
+    respawns.sort(key=lambda r: (r[2], r[1]), reverse=True)
 
     print(f"DELEGATION AUDIT — last {args.days} days")
     print(f"files scanned: {files_scanned} | agent creations: {len(all_creations)} "
@@ -247,6 +302,18 @@ def main():
     for c in frontier_mechanical[-args.max_events:]:
         print(f"  {c['ts'][:10]} {c['model']}: {c['title'][:80]}")
 
+    print(f"\n== Fan-out volume (sessions with > {FANOUT_WARN} agent creations): {len(wide_sessions)} ==")
+    for path, n in wide_sessions[:args.max_events]:
+        print(f"  {n:>4} creations  {os.path.basename(path)}")
+    if not wide_sessions and per_file:
+        top = ", ".join(f"{n}x {os.path.basename(p)}" for p, n in per_file.most_common(3))
+        print(f"  (none over threshold; widest: {top})")
+
+    print(f"\n== Quota/rate-limit deaths & re-spawn-after-death: {len(respawns)} sessions ==")
+    for path, ndeaths, after in respawns[:args.max_events]:
+        flag = "  <-- re-spawned INTO the wall" if after else ""
+        print(f"  deaths={ndeaths:>3}  creations-after-first-death={after:>3}  {os.path.basename(path)}{flag}")
+
     print(f"\n== Friction events (user pushback within 5 turns of a handoff): {len(frictioned)} ==")
     for c in list(reversed(frictioned))[:args.max_events]:
         strongest = sorted(c["friction"], key=lambda f: f[0] != "strong")[0]
@@ -254,7 +321,8 @@ def main():
         print(f"      quote: {strongest[2]}")
         print(f"      session: {os.path.basename(c['file'])}  cwd: {c['cwd']}")
 
-    if not (inherited or escalations or frontier_mechanical or frictioned):
+    if not (inherited or escalations or frontier_mechanical or frictioned
+            or wide_sessions or respawns):
         print("\nALL CLEAN — no misroute signals in the window.")
     return 0
 
