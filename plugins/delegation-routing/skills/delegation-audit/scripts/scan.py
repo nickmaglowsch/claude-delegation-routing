@@ -11,6 +11,14 @@ almost always too many agents (often recursive), not the wrong tier. So it
 counts agent creations per session and quota/rate-limit deaths, including
 re-spawns that fired after a death (circuit-breaker violations).
 
+And it measures where the tokens ACTUALLY went, from the `usage` already in
+every transcript line. Tier and agent count bound the price per agent; what
+bounds the total is turns x context size, because context grows monotonically
+and every turn re-reads all of it. Measured on a real 23-agent wave: cache
+reads 56% of spend, cache writes 29%, output+thinking 15% — so the lever is
+context hygiene, not effort. Subagent transcripts are included (that is where
+most of the spend lives), which also makes recursive fan-out visible.
+
 Still NOT counted (noisy — usually bad task packaging): raw retry counts, long
 runtimes, test failures, generic permission errors.
 """
@@ -25,7 +33,9 @@ from collections import Counter
 
 CREATE_TOOLS = {"mcp__paseo__create_agent"}
 NATIVE_AGENT_TOOLS = {"Agent", "Task"}
-SKIP_DIRS = {"subagents", "tool-results", "memory"}
+# `subagents/` is deliberately NOT skipped: it holds most of the token spend,
+# and it is the only place a recursive fan-out is visible.
+SKIP_DIRS = {"tool-results", "memory"}
 
 # Default transcript roots: native Claude sessions AND Paseo/ccs agent sessions.
 # Paseo agents live outside ~/.claude/projects, so scanning only the latter is
@@ -55,6 +65,25 @@ QUOTA_DEATH_RE = re.compile(
     r"overloaded_error|Claude AI usage limit reached)",
     re.IGNORECASE,
 )
+
+# An agent past this many turns is carrying a context it re-reads every turn.
+# Cost is ~quadratic in turn count, so this is the cap that actually bounds
+# spend — one 240-turn agent costs ~4x four 60-turn agents doing the same work.
+TURN_WARN = 80
+
+# List $/Mtok (input, output), version-tolerant substrings checked in order —
+# "haiku" before "opus"/"sonnet" so a compound id can't match the wrong row.
+# Non-Claude families are left unpriced rather than guessed; their tokens are
+# still counted and reported separately.
+PRICES = [
+    ("fable", 10.0, 50.0),
+    ("mythos", 10.0, 50.0),
+    ("haiku", 1.0, 5.0),
+    ("opus", 5.0, 25.0),
+    ("sonnet", 3.0, 15.0),
+]
+CACHE_WRITE_MULT = 1.25  # 5-minute TTL. 1h-TTL writes are 2x — cost is a floor.
+CACHE_READ_MULT = 0.1
 
 # Heuristic tier rank — version-tolerant substrings, checked in order.
 TIER_RULES = [
@@ -108,6 +137,79 @@ def family_of(provider_or_model):
     if "gpt" in s or "codex" in s:
         return "openai"
     return "unknown"
+
+
+def price_of(model):
+    m = (model or "").lower()
+    for sub, pin, pout in PRICES:
+        if sub in m:
+            return pin, pout
+    return None
+
+
+def is_subagent(path):
+    return "subagents" in path.split(os.sep)
+
+
+def session_key(path):
+    """Attribute a subagent transcript to the parent session that spawned it."""
+    parts = path.split(os.sep)
+    if "subagents" in parts:
+        return os.sep.join(parts[: parts.index("subagents")]) + ".jsonl"
+    return path
+
+
+def usage_of(entry):
+    """(model, usage) for a billed assistant turn, else None."""
+    if entry.get("type") != "assistant":
+        return None
+    msg = entry.get("message") or {}
+    usage = msg.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    return msg.get("model", ""), usage
+
+
+def cost_of(spend):
+    """Cost a {model: [fresh, write, read, out, msgs]} map at list prices.
+
+    Returns (total_usd, unpriced_msgs, [fresh$, write$, read$, out$]) — the
+    per-component split is what tells you which lever to pull, and it has to be
+    summed per model because a mixed fleet has no single price.
+    """
+    parts = [0.0, 0.0, 0.0, 0.0]
+    unpriced = 0
+    for model, (fresh, write, read, out, msgs) in spend.items():
+        price = price_of(model)
+        if price is None:
+            unpriced += msgs
+            continue
+        pin, pout = price
+        parts[0] += fresh * pin / 1e6
+        parts[1] += write * CACHE_WRITE_MULT * pin / 1e6
+        parts[2] += read * CACHE_READ_MULT * pin / 1e6
+        parts[3] += out * pout / 1e6
+    return sum(parts), unpriced, parts
+
+
+def merge_spend(into, other):
+    for model, vals in other.items():
+        acc = into.setdefault(model, [0, 0, 0, 0, 0])
+        for i, v in enumerate(vals):
+            acc[i] += v
+
+
+def totals(spend):
+    """(fresh, write, read, out, msgs) summed across models."""
+    out = [0, 0, 0, 0, 0]
+    for vals in spend.values():
+        for i, v in enumerate(vals):
+            out[i] += v
+    return out
+
+
+def fmt_tok(n):
+    return f"{n / 1e6:.2f}M" if n >= 1e6 else f"{n / 1e3:.0f}k"
 
 
 def word_set(text):
@@ -165,11 +267,13 @@ def creations_in(entry):
 
 
 def scan_file(path):
-    """Return (creations, user_turns, deaths); creations get friction attached in-place.
+    """Return (creations, user_turns, deaths, spend); friction is attached later.
 
     deaths = line indices where a quota/rate-limit/API death appears (any role).
+    spend  = {model: [fresh, cache_write, cache_read, output, msgs]}.
     """
-    creations, user_turns, deaths = [], [], []
+    creations, user_turns, deaths, spend = [], [], [], {}
+    depth = 1 if is_subagent(path) else 0
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             for idx, line in enumerate(fh):
@@ -182,19 +286,29 @@ def scan_file(path):
                     entry = json.loads(line)
                 except ValueError:
                     continue
+                billed = usage_of(entry)
+                if billed:
+                    model, usage = billed
+                    acc = spend.setdefault(model, [0, 0, 0, 0, 0])
+                    acc[0] += usage.get("input_tokens", 0) or 0
+                    acc[1] += usage.get("cache_creation_input_tokens", 0) or 0
+                    acc[2] += usage.get("cache_read_input_tokens", 0) or 0
+                    acc[3] += usage.get("output_tokens", 0) or 0
+                    acc[4] += 1
                 ts = entry.get("timestamp", "")
                 for tool, model, title, prompt, explicit in creations_in(entry):
                     creations.append({
                         "idx": idx, "ts": ts, "tool": tool, "model": model,
                         "title": title, "prompt": prompt, "explicit": explicit,
-                        "file": path, "cwd": entry.get("cwd", ""), "friction": [],
+                        "file": path, "depth": depth,
+                        "cwd": entry.get("cwd", ""), "friction": [],
                     })
                 text = user_text(entry)
                 if text:
                     user_turns.append((idx, text))
     except OSError:
         pass
-    return creations, user_turns, deaths
+    return creations, user_turns, deaths, spend
 
 
 def attach_friction(creations, user_turns):
@@ -240,6 +354,7 @@ def main():
     roots = args.projects_dir or DEFAULT_ROOTS
     cutoff = time.time() - args.days * 86400
     all_creations, files_scanned, file_deaths = [], 0, {}
+    file_spend, grand_spend = {}, {}
 
     for base in roots:
         for root, dirs, files in os.walk(base):
@@ -254,11 +369,14 @@ def main():
                 except OSError:
                     continue
                 files_scanned += 1
-                creations, user_turns, deaths = scan_file(path)
+                creations, user_turns, deaths, spend = scan_file(path)
                 attach_friction(creations, user_turns)
                 all_creations.extend(creations)
                 if deaths:
                     file_deaths[path] = deaths
+                if spend:
+                    file_spend[path] = spend
+                    merge_spend(grand_spend, spend)
 
     all_creations.sort(key=lambda c: c["ts"])
     escalations = find_escalations(all_creations)
@@ -269,8 +387,12 @@ def main():
     ]
     frictioned = [c for c in all_creations if c["friction"]]
 
+    recursive = [c for c in all_creations if c["depth"] > 0]
+
     # Fan-out volume per session, and quota-death / re-spawn-after-death.
-    per_file = Counter(c["file"] for c in all_creations)
+    # Keyed on the parent session so a subagent's own creations count against
+    # the wave that spawned it, not against a phantom extra "session".
+    per_file = Counter(session_key(c["file"]) for c in all_creations)
     wide_sessions = [(p, n) for p, n in per_file.most_common() if n > FANOUT_WARN]
     respawns = []
     for path, deaths in file_deaths.items():
@@ -284,6 +406,53 @@ def main():
     print(f"files scanned: {files_scanned} | agent creations: {len(all_creations)} "
           f"(paseo: {sum(1 for c in all_creations if c['tool'] in CREATE_TOOLS)}, "
           f"native: {sum(1 for c in all_creations if c['tool'] in NATIVE_AGENT_TOOLS)})")
+
+    fresh, write, read, out, msgs = totals(grand_spend)
+    total_cost, unpriced, parts = cost_of(grand_spend)
+    print("\n== Token spend (the number that actually moves) ==")
+    print(f"  billed turns  {msgs}")
+    print(f"  fresh input   {fmt_tok(fresh)}")
+    print(f"  cache WRITE   {fmt_tok(write)}   (billed x{CACHE_WRITE_MULT})")
+    print(f"  cache READ    {fmt_tok(read)}   (billed x{CACHE_READ_MULT})")
+    print(f"  output        {fmt_tok(out)}")
+    if fresh + write + read:
+        print(f"  cache hit     {read / (fresh + write + read) * 100:.1f}%  "
+              f"(high is normal — it does NOT mean spend is fine)")
+    if total_cost:
+        # Where the money is decides which lever to pull: read-dominated means
+        # trim context and turns; output-dominated means trim effort.
+        pct = [p / total_cost * 100 for p in parts]
+        print(f"  est. cost     ${total_cost:,.2f} at list prices"
+              + (f"  ({unpriced} turns on unpriced models excluded)" if unpriced else ""))
+        print(f"  split         reads {pct[2]:.0f}%  writes {pct[1]:.0f}%  "
+              f"output {pct[3]:.0f}%  fresh {pct[0]:.0f}%")
+        print("  lever         " + ("trim context and turns" if pct[1] + pct[2] >= 60
+                                    else "trim effort and output length"))
+
+    print("\n== Costliest agents (turns x context, not tier) ==")
+    ranked = []
+    for path, spend in file_spend.items():
+        cost = cost_of(spend)[0]
+        f, w, r, o, n = totals(spend)
+        ranked.append((cost, n, (f + w + r) / n if n else 0, path))
+    ranked.sort(reverse=True)
+    for cost, n, avg_ctx, path in ranked[: args.max_events]:
+        flag = f"  <-- over the {TURN_WARN}-turn budget" if n > TURN_WARN else ""
+        kind = "subagent" if is_subagent(path) else "session "
+        print(f"  ${cost:>8,.2f}  {n:>4} turns  avg ctx {fmt_tok(avg_ctx):>6}  "
+              f"{kind} {os.path.basename(path)}{flag}")
+    over = [r for r in ranked if r[1] > TURN_WARN]
+    if over:
+        print(f"  ({len(over)} agent(s) over the {TURN_WARN}-turn budget, "
+              f"${sum(r[0] for r in over):,.2f} combined — split these into "
+              f"successor agents that resume from a handoff file)")
+
+    print(f"\n== Recursive fan-out (agents spawned BY an agent): {len(recursive)} ==")
+    for c in recursive[-args.max_events:]:
+        print(f"  {c['ts'][:10]} {c['model']}: {c['title'][:70]}")
+        print(f"      inside: {os.path.basename(c['file'])}")
+    if not recursive:
+        print("  (none — fan-out stayed one level deep)")
 
     print("\n== Routing histogram (model -> count) ==")
     for model, n in Counter(c["model"] for c in all_creations).most_common():
@@ -322,8 +491,8 @@ def main():
         print(f"      session: {os.path.basename(c['file'])}  cwd: {c['cwd']}")
 
     if not (inherited or escalations or frontier_mechanical or frictioned
-            or wide_sessions or respawns):
-        print("\nALL CLEAN — no misroute signals in the window.")
+            or wide_sessions or respawns or over or recursive):
+        print("\nALL CLEAN — no misroute, volume, or context-bloat signals in the window.")
     return 0
 
 

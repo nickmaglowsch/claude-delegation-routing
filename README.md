@@ -23,11 +23,21 @@ A 14-day audit of one real setup found **83 of 90 agent creations ran on an inhe
 - `~/.claude/DELEGATION.md`, @-included from your global `~/.claude/CLAUDE.md`, so the think-before-handoff rule is in context every session: classify each task (trivial / normal / hard / really-hard; authoring vs reviewing), pick the tier, pass the model explicitly — never inherit. Tier ladder in stable names (no versioned IDs), with cross-family pairing: Claude authors → GPT reviews, and vice versa.
 - `~/.paseo/orchestration-preferences.json` (only if you use Paseo) — role→provider bindings for `impl`/`ui`/`research`/`planning`/`audit`, **generated from your live `list_models` output**, never from IDs baked into this repo. The only file that holds versioned model IDs.
 
-**`/delegation-audit`** — the refinement loop. A stateless Python scanner (stdlib only, zero LLM tokens) walks your session transcripts and reports misroutes: inherited defaults, escalations (same task re-launched bigger / other family), frontier models on mechanical work, and human pushback near handoffs (machine notifications and hook output are filtered out). It also drift-checks the bindings against `list_models` so new model releases get rebound instead of rotting. All edits are proposed as diffs and human-approved. Suggested cadence:
+**`/delegation-audit`** — the refinement loop. A stateless Python scanner (stdlib only, zero LLM tokens) walks your session transcripts — including `subagents/`, where most of the spend lives — and reports:
+
+- **Where the tokens went.** Total spend split into cache reads / cache writes / output, an estimated list-price cost, and the costliest individual agents ranked by `turns × avg context`. Tier bounds the price per token; `turns × context` bounds the total, and context is re-read on every turn — so cost is roughly quadratic in turn count. On a measured 23-agent wave the split was 56% reads / 29% writes / 15% output, and 37 over-budget agents were 86% of the bill while routing itself was clean. Also flags recursive fan-out (agents spawning agents), which the one-level rule forbids and which is invisible to any scanner that skips `subagents/`.
+- **Misroutes.** Inherited defaults, escalations (same task re-launched bigger / other family), frontier models on mechanical work, and human pushback near handoffs (machine notifications and hook output are filtered out).
+- **Drift.** Bindings checked against `list_models` so new model releases get rebound instead of rotting.
+
+Costs are list-price estimates for Claude models at 5-minute cache TTL — a floor, not a bill; the split and the ranking are the signal. All edits are proposed as diffs and human-approved. Suggested cadence:
 
 ```
 /loop 2w /delegation-audit
 ```
+
+## The two levers
+
+**Tier** bounds the price per agent. **Turns × context** bounds the total, and it is usually the bigger number — an 80-turn budget with a handoff file beats any amount of tier tuning on a fleet whose agents each run 200 turns. `DELEGATION.md` carries both rules; the audit tells you which one you are actually violating.
 
 ## Default routing philosophy
 

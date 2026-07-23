@@ -34,7 +34,17 @@ Picking the right *model* bounds the price per agent, not the total. Volume does
 - **Scope to the deliverable, not the topic.** "One email with a pick and a price" is a couple of lookups, not a market study. Match width to what actually ships.
 - **High stakes ≠ upgrade the whole fleet.** "This has to be accurate" justifies *one* workhorse/frontier verifier over cheap-tier gathered data — not the entire fleet on the frontier tier. Gather cheap, verify once.
 - **Circuit-breaker.** If agents die on quota / rate-limit / API errors, STOP. Do not re-spawn into the same wall — surface the failure and wait for it to clear.
-- **Watch context size too.** A fleet of large-context (e.g. 1M) agents multiplies token cost independently of tier. Use the smallest window that fits the task.
+- **Use the smallest context window that fits.** A fleet of 1M-window agents multiplies cost independently of tier.
+
+## Turn budget — the lever that actually bounds spend
+
+Tier sets the price per token; **turns × context** sets the total. Context only grows, and every turn re-reads all of it, so cost is roughly quadratic in turn count: one 240-turn agent costs ~4× four 60-turn agents doing the same work. Measured on a real 23-agent wave, cache reads were 56% of spend, writes 29%, output+thinking 15% — the money is in re-reading context, not in thinking. Capping agent *count* does not cap spend; capping turns does.
+
+- **~80 turns per agent.** Past that, have it write findings to a handoff file and spawn a successor that reads the file instead of inheriting the history.
+- **Keep tool output out of context.** `head`/`tail`/`grep -c`/`--quiet` on build, test, and log output; read the line ranges you need, not whole files. Every dumped blob is re-read on every later turn of that agent.
+- **Brief tight, scope narrow.** An agent forced to rediscover the codebase pays for that discovery on every subsequent turn.
+- **Orchestrator hygiene.** The orchestrator pays its own full context every turn too. One session per wave, resuming from a committed scaffold plus a notes file, beats one session spanning every wave.
+- **Spend is concentrated, so audit the tail.** In that wave the top 6 of 23 agents were half the cost. Fix the few fat agents, not the fleet average.
 
 ## Contrarian pairing
 
