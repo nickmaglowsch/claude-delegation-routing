@@ -1,6 +1,6 @@
 {
   "name": "delegation-routing",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Deliberate model routing for agent fan-out: /delegation-setup templates a think-before-handoff policy (DELEGATION.md + optional Paseo bindings) from your live model list, and /delegation-audit refines it over time from real transcript misroutes.",
   "author": {
     "name": "Nicholas Salgueiro",
