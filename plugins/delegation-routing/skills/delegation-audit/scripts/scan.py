@@ -33,12 +33,13 @@ from collections import Counter
 
 CREATE_TOOLS = {"mcp__paseo__create_agent"}
 NATIVE_AGENT_TOOLS = {"Agent", "Task"}
+REUSE_TOOLS = {"mcp__paseo__send_agent_prompt", "SendMessage"}
 # `subagents/` is deliberately NOT skipped: it holds most of the token spend,
 # and it is the only place a recursive fan-out is visible.
 SKIP_DIRS = {"tool-results", "memory"}
 
 # Default transcript roots: native Claude sessions AND Paseo/ccs agent sessions.
-# Paseo agents live outside ~/.claude/projects, so scanning only the latter is
+# Paseo agents live outside ~/.claude/projects, so scanning only the former is
 # blind to exactly the agents that fan out. A missing root yields nothing, so
 # listing both is safe everywhere.
 DEFAULT_ROOTS = [
@@ -248,7 +249,7 @@ def user_text(entry):
 
 
 def creations_in(entry):
-    """Yield (tool, model_or_provider, title, prompt_snippet, explicit) for agent-creation tool_use blocks."""
+    """Yield (tool, model_or_provider, title, prompt_snippet, explicit, id) for agent-creation tool_use blocks."""
     if entry.get("type") != "assistant":
         return
     content = (entry.get("message") or {}).get("content")
@@ -259,20 +260,50 @@ def creations_in(entry):
             continue
         name = block.get("name", "")
         inp = block.get("input") or {}
+        bid = block.get("id", "")
         if name in CREATE_TOOLS:
-            yield name, inp.get("provider", ""), inp.get("title", ""), str(inp.get("initialPrompt", ""))[:200], True
+            yield name, inp.get("provider", ""), inp.get("title", ""), str(inp.get("initialPrompt", ""))[:200], True, bid
         elif name in NATIVE_AGENT_TOOLS:
             model = inp.get("model")
-            yield name, model or "(inherited)", inp.get("description", ""), str(inp.get("prompt", ""))[:200], bool(model)
+            yield name, model or "(inherited)", inp.get("description", ""), str(inp.get("prompt", ""))[:200], bool(model), bid
+
+
+def reuse_calls_in(entry):
+    """Yield one marker per follow-up prompt sent to an already-running agent."""
+    if entry.get("type") != "assistant":
+        return
+    content = (entry.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") in REUSE_TOOLS:
+            yield block.get("name")
+
+
+def results_in(entry):
+    """Yield (tool_use_id, is_error) for tool results carried on a user entry."""
+    if entry.get("type") != "user":
+        return
+    content = (entry.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            yield block.get("tool_use_id", ""), bool(block.get("is_error"))
 
 
 def scan_file(path):
-    """Return (creations, user_turns, deaths, spend); friction is attached later.
+    """Return (creations, user_turns, deaths, spend, signals); friction is attached later.
 
-    deaths = line indices where a quota/rate-limit/API death appears (any role).
-    spend  = {model: [fresh, cache_write, cache_read, output, msgs]}.
+    deaths  = line indices where a quota/rate-limit/API death appears (any role).
+    spend   = {model: [fresh, cache_write, cache_read, output, msgs]}.
+    signals = what find_respawns needs, per file: line indexes of follow-up prompts
+              and of conversation boundaries (a user entry that isn't just a tool
+              result — a human turn or a paseo agent-finished notification), plus
+              the ids of creations that errored out.
     """
     creations, user_turns, deaths, spend = [], [], [], {}
+    signals = {"reuse": [], "boundaries": [], "errored": set()}
     depth = 1 if is_subagent(path) else 0
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -296,19 +327,28 @@ def scan_file(path):
                     acc[3] += usage.get("output_tokens", 0) or 0
                     acc[4] += 1
                 ts = entry.get("timestamp", "")
-                for tool, model, title, prompt, explicit in creations_in(entry):
+                for tool, model, title, prompt, explicit, bid in creations_in(entry):
                     creations.append({
-                        "idx": idx, "ts": ts, "tool": tool, "model": model,
+                        "idx": idx, "ts": ts, "tool": tool, "model": model, "id": bid,
                         "title": title, "prompt": prompt, "explicit": explicit,
                         "file": path, "depth": depth,
                         "cwd": entry.get("cwd", ""), "friction": [],
                     })
+                for _ in reuse_calls_in(entry):
+                    signals["reuse"].append(idx)
+                saw_result = False
+                for tool_use_id, is_error in results_in(entry):
+                    saw_result = True
+                    if is_error:
+                        signals["errored"].add(tool_use_id)
+                if entry.get("type") == "user" and not saw_result:
+                    signals["boundaries"].append(idx)
                 text = user_text(entry)
                 if text:
                     user_turns.append((idx, text))
     except OSError:
         pass
-    return creations, user_turns, deaths, spend
+    return creations, user_turns, deaths, spend, signals
 
 
 def attach_friction(creations, user_turns):
@@ -337,9 +377,49 @@ def find_escalations(creations):
             if not similar(a["title"] + " " + a["prompt"], b["title"] + " " + b["prompt"]):
                 continue
             ta, tb = tier_of(a["model"]), tier_of(b["model"])
-            fam_switch = family_of(a["model"]) != family_of(b["model"]) != "unknown"
+            fa, fb = family_of(a["model"]), family_of(b["model"])
+            fam_switch = fa != fb and "unknown" not in (fa, fb)
             if (ta is not None and tb is not None and tb > ta) or fam_switch:
                 out.append((a, b, "tier-up" if (ta is not None and tb is not None and tb > ta) else "family-switch"))
+    return out
+
+
+def find_respawns(creations, signals_by_file):
+    """Same-session re-launch of a similar task at the SAME tier and family, after the
+    first agent already reported back and with no follow-up prompt in between — the
+    live agent should have been reused instead.
+
+    ponytail: any reuse call in the window suppresses the pair, even one aimed at a
+    different agent. Under-reporting is the safe direction for an audit signal.
+    """
+    out = []
+    for i, a in enumerate(creations):
+        sig = signals_by_file.get(a["file"])
+        # Unknown tier ((inherited), unrecognized IDs) can't be compared — those
+        # creations are already reported under inherited-defaults.
+        tier = tier_of(a["model"])
+        if sig is None or tier is None:
+            continue
+        # A create that errored out never produced an agent; the retry isn't a respawn.
+        if a["id"] in sig["errored"]:
+            continue
+        for b in creations[i + 1:]:
+            if b["file"] != a["file"] or tier_of(b["model"]) != tier:
+                continue
+            if family_of(a["model"]) != family_of(b["model"]):
+                continue
+            if not similar(a["title"] + " " + a["prompt"], b["title"] + " " + b["prompt"]):
+                continue
+            if any(a["idx"] < r < b["idx"] for r in sig["reuse"]):
+                continue
+            # Agent `a` has to have reported back before `b` was launched — otherwise
+            # this is a parallel fan-out wave, not a respawn. Only a boundary proves
+            # that: both paseo create_agent and backgrounded native agents return a
+            # launch acknowledgement immediately, so their tool result proves nothing.
+            if not any(a["idx"] < i < b["idx"] for i in sig["boundaries"]):
+                continue
+            out.append((a, b))
+            break
     return out
 
 
@@ -354,7 +434,7 @@ def main():
     roots = args.projects_dir or DEFAULT_ROOTS
     cutoff = time.time() - args.days * 86400
     all_creations, files_scanned, file_deaths = [], 0, {}
-    file_spend, grand_spend = {}, {}
+    file_spend, grand_spend, signals_by_file = {}, {}, {}
 
     for base in roots:
         for root, dirs, files in os.walk(base):
@@ -369,9 +449,10 @@ def main():
                 except OSError:
                     continue
                 files_scanned += 1
-                creations, user_turns, deaths, spend = scan_file(path)
+                creations, user_turns, deaths, spend, signals = scan_file(path)
                 attach_friction(creations, user_turns)
                 all_creations.extend(creations)
+                signals_by_file[path] = signals
                 if deaths:
                     file_deaths[path] = deaths
                 if spend:
@@ -380,6 +461,8 @@ def main():
 
     all_creations.sort(key=lambda c: c["ts"])
     escalations = find_escalations(all_creations)
+    respawns = find_respawns(all_creations, signals_by_file)
+    reuse_total = sum(len(s["reuse"]) for s in signals_by_file.values())
     inherited = [c for c in all_creations if not c["explicit"]]
     frontier_mechanical = [
         c for c in all_creations
@@ -394,18 +477,23 @@ def main():
     # the wave that spawned it, not against a phantom extra "session".
     per_file = Counter(session_key(c["file"]) for c in all_creations)
     wide_sessions = [(p, n) for p, n in per_file.most_common() if n > FANOUT_WARN]
-    respawns = []
+    death_respawns = []
     for path, deaths in file_deaths.items():
         first = min(deaths)
         after = sum(1 for c in all_creations if c["file"] == path and c["idx"] > first)
         if after > 0 or len(deaths) >= DEATH_CLUSTER:
-            respawns.append((path, len(deaths), after))
-    respawns.sort(key=lambda r: (r[2], r[1]), reverse=True)
+            death_respawns.append((path, len(deaths), after))
+    death_respawns.sort(key=lambda r: (r[2], r[1]), reverse=True)
 
     print(f"DELEGATION AUDIT — last {args.days} days")
     print(f"files scanned: {files_scanned} | agent creations: {len(all_creations)} "
           f"(paseo: {sum(1 for c in all_creations if c['tool'] in CREATE_TOOLS)}, "
           f"native: {sum(1 for c in all_creations if c['tool'] in NATIVE_AGENT_TOOLS)})")
+    if reuse_total:
+        print(f"follow-up prompts to existing agents: {reuse_total} "
+              f"| creations per follow-up: {len(all_creations) / reuse_total:.1f}")
+    else:
+        print("follow-up prompts to existing agents: 0 — every handoff was a fresh agent")
 
     fresh, write, read, out, msgs = totals(grand_spend)
     total_cost, unpriced, parts = cost_of(grand_spend)
@@ -467,6 +555,11 @@ def main():
     for a, b, kind in escalations[-args.max_events:]:
         print(f"  [{kind}] {a['ts'][:10]} {a['model']} -> {b['model']}: {a['title'][:70]}")
 
+    print(f"\n== Respawns (similar task, same tier, no follow-up in between): {len(respawns)} ==")
+    for a, b in respawns[-args.max_events:]:
+        print(f"  {a['ts'][:10]} {a['model']} x2: {a['title'][:70]}")
+        print(f"      session: {os.path.basename(a['file'])}  cwd: {a['cwd']}")
+
     print(f"\n== Frontier model on mechanical-looking work: {len(frontier_mechanical)} ==")
     for c in frontier_mechanical[-args.max_events:]:
         print(f"  {c['ts'][:10]} {c['model']}: {c['title'][:80]}")
@@ -478,8 +571,8 @@ def main():
         top = ", ".join(f"{n}x {os.path.basename(p)}" for p, n in per_file.most_common(3))
         print(f"  (none over threshold; widest: {top})")
 
-    print(f"\n== Quota/rate-limit deaths & re-spawn-after-death: {len(respawns)} sessions ==")
-    for path, ndeaths, after in respawns[:args.max_events]:
+    print(f"\n== Quota/rate-limit deaths & re-spawn-after-death: {len(death_respawns)} sessions ==")
+    for path, ndeaths, after in death_respawns[:args.max_events]:
         flag = "  <-- re-spawned INTO the wall" if after else ""
         print(f"  deaths={ndeaths:>3}  creations-after-first-death={after:>3}  {os.path.basename(path)}{flag}")
 
@@ -490,9 +583,9 @@ def main():
         print(f"      quote: {strongest[2]}")
         print(f"      session: {os.path.basename(c['file'])}  cwd: {c['cwd']}")
 
-    if not (inherited or escalations or frontier_mechanical or frictioned
-            or wide_sessions or respawns or over or recursive):
-        print("\nALL CLEAN — no misroute, volume, or context-bloat signals in the window.")
+    if not (inherited or escalations or respawns or frontier_mechanical or frictioned
+            or wide_sessions or death_respawns or over or recursive):
+        print("\nALL CLEAN — no misroute, reuse, volume, or context-bloat signals in the window.")
     return 0
 
 

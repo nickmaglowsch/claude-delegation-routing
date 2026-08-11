@@ -46,9 +46,21 @@ Tier sets the price per token; **turns × context** sets the total. Context only
 - **Orchestrator hygiene.** The orchestrator pays its own full context every turn too. One session per wave, resuming from a committed scaffold plus a notes file, beats one session spanning every wave.
 - **Spend is concentrated, so audit the tail.** In that wave the top 6 of 23 agents were half the cost. Fix the few fat agents, not the fleet average.
 
+## Reuse before respawn
+
+A finished agent is still alive and still holds its context. The next slice of the same work, a correction, or a review's fix-ups go back to *that* agent — a fresh one pays the context-rebuild cost again and throws away everything the first one learned.
+
+- **Follow-up on the same thread → `mcp__paseo__send_agent_prompt`** (native equivalent: `SendMessage` to the existing agent). Review came back? Send it to the author. Don't spawn author #2.
+- **Spawn new only when** the tier must change, the task is genuinely unrelated, the agent's context is poisoned and it can't back out, or it has hit the turn budget above.
+- **Kill/archive only when done for good.** Killing an agent you're about to re-create at the same tier is pure loss.
+- A respawn counts against the fan-out cap; a follow-up doesn't. But a follow-up isn't free either — it re-reads the whole thread, which is exactly what the turn budget prices. Check `get_agent_status` → `lastUsage.contextWindowUsedTokens` before piling on: reuse a small thread, hand off a big one.
+- Workflow `agent()` calls are one-shot by design — this rule is about interactive fan-out.
+
 ## Contrarian pairing
 
 Substantive work authored by a Claude agent gets its review from a Codex agent, and vice versa — cross-family review catches blind spots same-family review misses. Frontier-vs-frontier (Fable vs top Codex tier) only to settle hard disagreements.
+
+The native Agent tool cannot select Codex/OpenAI models — it runs Claude models only. So it can be the cross-family reviewer for Codex-authored work, but never for Claude-authored work: route those through Paseo `create_agent`.
 
 ## Where the concrete bindings live
 
