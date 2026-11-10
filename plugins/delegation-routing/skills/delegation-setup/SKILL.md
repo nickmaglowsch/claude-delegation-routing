@@ -9,9 +9,21 @@ Templates the routing policy into place. Nothing here ships frozen model IDs —
 
 ## Step 1: Install the policy file
 
-Copy `${CLAUDE_PLUGIN_ROOT}/templates/DELEGATION.template.md` to `~/.claude/DELEGATION.md`. If the destination already exists and differs, show a diff and ask before replacing.
+The policy is two files:
+- `~/.claude/DELEGATION.md` stays identical to the plugin template, so updates apply cleanly.
+- `~/.claude/DELEGATION.local.md` holds the user's own overrides and is never overwritten.
 
-Then ensure `~/.claude/CLAUDE.md` contains a line `@DELEGATION.md` (append it if missing; create the file if absent). This puts the think-before-handoff rule in context every session.
+1. If `~/.claude/DELEGATION.local.md` does not exist, copy `${CLAUDE_PLUGIN_ROOT}/templates/DELEGATION.local.template.md` there. If it exists, leave it untouched.
+2. Copy `${CLAUDE_PLUGIN_ROOT}/templates/DELEGATION.template.md` to `~/.claude/DELEGATION.md`. If the destination already exists and differs, show a diff and ask before replacing it.
+   - If the differences look like the user's own edits rather than an older template, offer to move them into `DELEGATION.local.md` first, so nothing they wrote is lost.
+   - Back up the old file to `DELEGATION.md.bak-<YYYYMMDD-HHMMSS>` with `cp -n`.
+3. Make sure `~/.claude/CLAUDE.md` contains `@DELEGATION.md` and then `@DELEGATION.local.md`, in that order.
+   - If `@DELEGATION.md` is missing, insert it just before `@DELEGATION.local.md`. If neither line is present, put both at the top.
+   - If `@DELEGATION.local.md` is missing, insert it just after `@DELEGATION.md`.
+   - If the two lines appear in the wrong order, swap them.
+   - Create `CLAUDE.md` if it is absent.
+
+   This puts the policy and then its overrides in context every session.
 
 ## Step 2: Generate Paseo bindings (skip cleanly if no Paseo)
 

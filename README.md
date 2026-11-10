@@ -21,6 +21,7 @@ A 14-day audit of one real setup found **83 of 90 agent creations ran on an inhe
 **`/delegation-setup`** — templates the policy into place, as a template, not frozen state:
 
 - `~/.claude/DELEGATION.md`, @-included from your global `~/.claude/CLAUDE.md`, so the think-before-handoff rule is in context every session: classify each task (trivial / normal / hard / really-hard; authoring vs reviewing), pick the tier, pass the model explicitly — never inherit. Tier ladder in stable names (no versioned IDs), with cross-family pairing: Claude authors → GPT reviews, and vice versa.
+- `~/.claude/DELEGATION.local.md`: your own overrides, such as which model is your top tier or your gateway advisor. It is @-included after `DELEGATION.md` and wins where they conflict. Setup creates it once and never overwrites it, so `DELEGATION.md` can stay identical to the template and plugin updates apply cleanly.
 - `~/.paseo/orchestration-preferences.json` (only if you use Paseo) — role→provider bindings for `impl`/`ui`/`research`/`planning`/`audit`, **generated from your live `list_models` output**, never from IDs baked into this repo. The only file that holds versioned model IDs.
 
 - `~/.claude/agents/scout.md` and `~/.claude/hooks/scout_readonly.py` (optional) — a cheap, read-only code-search subagent for "where is X / who calls X / how many X". See [scout](#scout-a-cheap-lookup-agent-that-counts-right) below.
