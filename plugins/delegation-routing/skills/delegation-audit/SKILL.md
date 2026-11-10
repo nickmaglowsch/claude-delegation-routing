@@ -45,7 +45,7 @@ A respawn is a *reuse* miss, not a tier miss — the fix is `send_agent_prompt` 
 
 For a costly over-budget agent, find *what* inflated its context instead: grep its transcript for the biggest tool results (whole-file `Read`s, unfiltered build/test/log output, repeated re-reads of the same file). Name the specific habit — "piped full `npm run build` output 11 times" is actionable; "used too much context" is not.
 
-**3b — drift check.** If the Paseo MCP server is available, call `mcp__paseo__list_models` for each enabled provider. Compare against the bindings in `~/.paseo/orchestration-preferences.json` and the tier assumptions in `~/.claude/DELEGATION.md`:
+**3b — drift check.** If the Paseo MCP server is available, call `mcp__paseo__list_models` for each enabled provider. Compare against the bindings in `~/.paseo/orchestration-preferences.json` and the tier assumptions in `~/.claude/DELEGATION.md` as modified by `~/.claude/DELEGATION.local.md`. A tier choice the local file records as a user override is not drift, even when `list_models` describes another model as stronger. Never propose rebinding it back.
 - A bound model ID no longer listed → stale binding, propose the replacement.
 - A new top-tier model appeared (e.g. a new GPT frontier, a new Opus) → propose rebinding that tier.
 
@@ -53,9 +53,10 @@ For a costly over-budget agent, find *what* inflated its context instead: grep i
 
 For each confirmed misroute or drift, propose ONE specific edit: file path + before/after diff + one-sentence rationale. Do NOT apply edits automatically — wait for the user's explicit OK on each, then apply with Edit.
 
-Two kinds of edit, two sets of targets:
+Three kinds of edit, three sets of targets:
 
-- **Policy / tier / turn-budget rules** → `~/.claude/DELEGATION.md`, *and* `plugins/delegation-routing/templates/DELEGATION.template.md` if the plugin repo is checked out on this machine. The live file fixes this machine; the template is what `/delegation-setup` writes on the next one, so a live-file-only fix silently reverts on the next install. Propose the pair as a single edit.
+- **General policy / tier / turn-budget rules** that would help anyone → `~/.claude/DELEGATION.md`, *and* `plugins/delegation-routing/templates/DELEGATION.template.md` if the plugin repo is checked out on this machine. The live file fixes this machine; the template is what `/delegation-setup` writes on the next one, so a live-file-only fix silently reverts on the next install. Propose the pair as a single edit. Keep the two files identical.
+- **Personal choices** (which model is this user's top tier, a gateway advisor, caps tuned to their quota) → `~/.claude/DELEGATION.local.md` only. Never put them in the template, which is public and shared.
 - **Concrete bindings** → `~/.paseo/orchestration-preferences.json` only. Never templated: the template's bindings are generated from the live model list at setup time.
 
 Nothing else is an edit target.
