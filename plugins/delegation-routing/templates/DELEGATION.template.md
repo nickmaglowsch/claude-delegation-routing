@@ -17,12 +17,16 @@ Classify on two axes:
 |---|---|
 | Claude frontier (`fable`) | Really-hard only: second attempts, gnarly architecture. Never routine work. |
 | Claude workhorse (`opus`) | Default for implementation, UI, and authoring work. |
-| Claude cheap (`sonnet` / `haiku`) | Research/search (`sonnet`); trivial mechanical work and tests (`haiku`). |
+| Claude cheap (`sonnet` / `haiku`) | Research and "how does X work" questions (`sonnet`); read-only code lookups and counts (the `scout` agent on `haiku`, see below); trivial mechanical work and tests (`haiku`). |
 | OpenAI frontier (top Codex tier, thinking xhigh) | Hard contrarian analysis, high-stakes reviews, repeatedly inconclusive reviews. |
 | OpenAI workhorse (default Codex tier) | Default contrarian reviewer and design challenger. |
 | OpenAI cheap (mini Codex tier) | Trivial mechanical work when a Codex agent fits better. |
 
 Native Agent/Workflow `model` values are the stable aliases: `haiku` / `sonnet` / `opus` / `fable`.
+
+**Code lookups go to `scout`.** Send read-only lookups and counts ("where is X", "who calls X", "list every X", "how many X") to the native `scout` agent, which `/delegation-setup` installs. Call it as `subagent_type: "scout"`, `model: "haiku"`. Passing any other `model` overrides scout's Haiku. Use scout instead of Explore for these.
+- When the target file is already known, do the lookup yourself without an agent.
+- If scout reports that its read-only hook blocked a command, answer with the allowed tools or report the limit. Never edit the hook as part of a lookup, and never route around it.
 
 ## Fan-out budget — how many, how deep
 
